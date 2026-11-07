@@ -4,6 +4,7 @@
 
 package io.flutter.plugins.camera;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -20,6 +21,7 @@ import android.graphics.SurfaceTexture;
 import android.hardware.camera2.*;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.media.CamcorderProfile;
+import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Build;
@@ -59,6 +61,8 @@ import io.flutter.view.TextureRegistry;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -1218,6 +1222,28 @@ public class CameraTest {
 
   @Test
   public void close_shouldWaitForACaptureRequestThatIsStillBeingSent() throws Exception {
+    assertWaitsForACaptureRequestThatIsStillBeingSent(camera::close, "close");
+  }
+
+  @Test
+  public void setDescriptionWhileRecording_shouldWaitForACaptureRequestThatIsStillBeingSent()
+      throws Exception {
+    camera.mediaRecorder = mock(MediaRecorder.class);
+    camera.recordingVideo = true;
+    camera.videoRenderer = mock(VideoRenderer.class);
+    SdkCapabilityChecker.SDK_VERSION = Build.VERSION_CODES.O;
+    CameraProperties newCameraProperties = mock(CameraProperties.class);
+    assertWaitsForACaptureRequestThatIsStillBeingSent(
+        () -> camera.setDescriptionWhileRecording(newCameraProperties), "stopAndReleaseCamera");
+  }
+
+  /**
+   * Holds {@link Camera#unlockAutoFocus} inside its capture request on one thread, runs {@code
+   * platformCall} on another, and checks that the call waits in {@code waitingIn} without closing
+   * the device until the request returns.
+   */
+  private void assertWaitsForACaptureRequestThatIsStillBeingSent(
+      Runnable platformCall, String waitingIn) throws Exception {
     CountDownLatch captureStarted = new CountDownLatch(1);
     CountDownLatch captureMayFinish = new CountDownLatch(1);
     when(mockCaptureSession.capture(any(), any(), any()))
@@ -1239,25 +1265,129 @@ public class CameraTest {
     camera.cameraDevice = device;
 
     Thread backgroundThread = new Thread(camera::unlockAutoFocus);
-    Thread platformThread = new Thread(camera::close);
+    Thread platformThread = new Thread(platformCall);
     try {
       backgroundThread.start();
       assertTrue(captureStarted.await(5, TimeUnit.SECONDS));
       platformThread.start();
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
       while (!deviceClosed.get()
-          && !isBlockedIn(platformThread, "stopAndReleaseCamera")
+          && !isBlockedIn(platformThread, waitingIn)
           && System.nanoTime() < deadline) {
         Thread.sleep(1);
       }
       assertFalse(deviceClosed.get());
-      assertTrue(isBlockedIn(platformThread, "stopAndReleaseCamera"));
+      assertTrue(isBlockedIn(platformThread, waitingIn));
     } finally {
       captureMayFinish.countDown();
       backgroundThread.join(5000);
       platformThread.join(5000);
     }
     assertTrue(deviceClosed.get());
+  }
+
+  @Test
+  public void onImageAvailable_shouldSaveThePictureAndAnswerWithItsPath() throws Exception {
+    Messages.Result<String> result = prepareStillCapture();
+    File file = File.createTempFile("CAP", ".jpg");
+    file.deleteOnExit();
+    camera.captureFile = file;
+    camera.cameraCaptureCallback.setCameraState(CameraState.STATE_CAPTURING);
+    Image image = mockJpegImage(new byte[] {1, 2, 3});
+    when(camera.pictureImageReader.acquireNextImage()).thenReturn(image);
+    AtomicBoolean answeredHoldingTheLock = new AtomicBoolean(true);
+    doAnswer(
+            invocation -> {
+              answeredHoldingTheLock.set(Thread.holdsLock(camera.captureSessionLock));
+              return null;
+            })
+        .when(mockDartMessenger)
+        .finish(any(), any());
+
+    camera.onImageAvailable(camera.pictureImageReader);
+
+    verify(mockDartMessenger, times(1)).finish(result, file.getAbsolutePath());
+    assertFalse(answeredHoldingTheLock.get());
+    assertArrayEquals(new byte[] {1, 2, 3}, Files.readAllBytes(file.toPath()));
+    verify(image, times(1)).close();
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void onImageAvailable_shouldEndThePictureWhenTheCameraIsAlreadyClosed() {
+    Messages.Result<String> result = prepareStillCapture();
+    camera.cameraCaptureCallback.setCameraState(CameraState.STATE_CAPTURING);
+    ImageReader reader = camera.pictureImageReader;
+    camera.close();
+
+    camera.onImageAvailable(reader);
+
+    verify(reader, never()).acquireNextImage();
+    verify(mockDartMessenger, times(1))
+        .error(result, "cameraAccess", "The camera was closed.", null);
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void close_shouldWaitForAPictureThatIsStillBeingRead() throws Exception {
+    Messages.Result<String> result = prepareStillCapture();
+    File file = File.createTempFile("CAP", ".jpg");
+    file.deleteOnExit();
+    camera.captureFile = file;
+    ImageReader reader = camera.pictureImageReader;
+    CountDownLatch readStarted = new CountDownLatch(1);
+    CountDownLatch readMayFinish = new CountDownLatch(1);
+    Image image = mockJpegImage(new byte[] {1});
+    Image.Plane[] planes = image.getPlanes();
+    when(image.getPlanes())
+        .thenAnswer(
+            invocation -> {
+              readStarted.countDown();
+              readMayFinish.await();
+              return planes;
+            });
+    when(reader.acquireNextImage()).thenReturn(image);
+    AtomicBoolean readerClosed = new AtomicBoolean(false);
+    AtomicBoolean closedUnderLock = new AtomicBoolean(false);
+    doAnswer(
+            invocation -> {
+              closedUnderLock.set(Thread.holdsLock(camera.captureSessionLock));
+              readerClosed.set(true);
+              return null;
+            })
+        .when(reader)
+        .close();
+
+    Thread backgroundThread = new Thread(() -> camera.onImageAvailable(reader));
+    Thread platformThread = new Thread(camera::close);
+    try {
+      backgroundThread.start();
+      assertTrue(readStarted.await(5, TimeUnit.SECONDS));
+      platformThread.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (!readerClosed.get()
+          && !isBlockedIn(platformThread, "close")
+          && System.nanoTime() < deadline) {
+        Thread.sleep(1);
+      }
+      assertFalse(readerClosed.get());
+      assertTrue(isBlockedIn(platformThread, "close"));
+    } finally {
+      readMayFinish.countDown();
+      backgroundThread.join(5000);
+      platformThread.join(5000);
+    }
+    assertTrue(readerClosed.get());
+    assertTrue(closedUnderLock.get());
+    verify(mockDartMessenger, times(1)).finish(result, file.getAbsolutePath());
+  }
+
+  private static Image mockJpegImage(byte[] bytes) {
+    Image.Plane plane = mock(Image.Plane.class);
+    when(plane.getBuffer()).thenReturn(ByteBuffer.wrap(bytes));
+    Image image = mock(Image.class);
+    when(image.getPlanes()).thenReturn(new Image.Plane[] {plane});
+    return image;
   }
 
   private static boolean isBlockedIn(Thread thread, String methodName) {

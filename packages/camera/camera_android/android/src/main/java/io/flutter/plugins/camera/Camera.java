@@ -121,11 +121,13 @@ class Camera
   private HandlerThread backgroundHandlerThread;
 
   /**
-   * Guards every use of {@link #captureSession} and every change to {@link #cameraDevice}.
+   * Guards every use of {@link #captureSession}, every change to {@link #cameraDevice}, and the
+   * reading of a picture's image against the closing of {@link #pictureImageReader}.
    *
    * <p>The platform thread closes the camera while the background thread may still be finishing a
    * capture. Without a single lock, the background thread can pass its null check and then submit a
-   * request to a session whose device has just been closed, which throws on that thread.
+   * request to a session whose device has just been closed, or read a picture whose reader has just
+   * been closed, which throws on that thread.
    */
   final Object captureSessionLock = new Object();
 
@@ -145,7 +147,7 @@ class Camera
   /** True when the preview is paused. */
   @VisibleForTesting boolean pausedPreview;
 
-  private File captureFile;
+  @VisibleForTesting File captureFile;
 
   /** Holds the current capture timeouts */
   private CaptureTimeoutsWrapper captureTimeouts;
@@ -1328,28 +1330,40 @@ class Camera
   public void onImageAvailable(ImageReader reader) {
     Log.i(TAG, "onImageAvailable");
 
-    // Use acquireNextImage since image reader is only for one image.
-    Image image = reader.acquireNextImage();
-    if (image == null) {
-      return;
+    ImageSaver saver;
+    synchronized (captureSessionLock) {
+      if (pictureImageReader == null) {
+        failPictureCapture("The camera was closed.");
+        return;
+      }
+
+      // Use acquireNextImage since image reader is only for one image.
+      Image image = reader.acquireNextImage();
+      if (image == null) {
+        return;
+      }
+
+      // The image must be read under the lock: close() closes the reader under it, and an image
+      // whose reader is closed can no longer be read.
+      saver =
+          new ImageSaver(
+              image,
+              captureFile,
+              new ImageSaver.Callback() {
+                @Override
+                public void onComplete(@NonNull String absolutePath) {
+                  dartMessenger.finish(flutterResult, absolutePath);
+                }
+
+                @Override
+                public void onError(@NonNull String errorCode, @NonNull String errorMessage) {
+                  dartMessenger.error(flutterResult, errorCode, errorMessage, null);
+                }
+              });
+      cameraCaptureCallback.setCameraState(CameraState.STATE_PREVIEW);
     }
-
-    backgroundHandler.post(
-        new ImageSaver(
-            image,
-            captureFile,
-            new ImageSaver.Callback() {
-              @Override
-              public void onComplete(@NonNull String absolutePath) {
-                dartMessenger.finish(flutterResult, absolutePath);
-              }
-
-              @Override
-              public void onError(@NonNull String errorCode, @NonNull String errorMessage) {
-                dartMessenger.error(flutterResult, errorCode, errorMessage, null);
-              }
-            }));
-    cameraCaptureCallback.setCameraState(CameraState.STATE_PREVIEW);
+    // Run here, not posted: close() may already have cleared backgroundHandler.
+    saver.run();
   }
 
   @VisibleForTesting
@@ -1439,11 +1453,13 @@ class Camera
   public void close() {
     Log.i(TAG, "close");
 
-    stopAndReleaseCamera();
+    synchronized (captureSessionLock) {
+      stopAndReleaseCamera();
 
-    if (pictureImageReader != null) {
-      pictureImageReader.close();
-      pictureImageReader = null;
+      if (pictureImageReader != null) {
+        pictureImageReader.close();
+        pictureImageReader = null;
+      }
     }
     if (imageStreamReader != null) {
       imageStreamReader.close();

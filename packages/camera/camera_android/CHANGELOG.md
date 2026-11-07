@@ -1,3 +1,7 @@
+## 0.10.12+3
+
+* Fixes a crash when the camera is closed while a picture is being saved.
+
 ## 0.10.12+2
 
 * Fixes a crash when the camera is closed right after a picture is taken.

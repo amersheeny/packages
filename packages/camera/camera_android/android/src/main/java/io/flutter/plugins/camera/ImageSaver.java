@@ -16,8 +16,8 @@ import java.nio.ByteBuffer;
 /** Saves a JPEG {@link Image} into the specified {@link File}. */
 public class ImageSaver implements Runnable {
 
-  /** The JPEG image */
-  private final Image image;
+  /** The JPEG image's bytes. */
+  private final byte[] bytes;
 
   /** The file we save the image into. */
   private final File file;
@@ -26,23 +26,26 @@ public class ImageSaver implements Runnable {
   private final Callback callback;
 
   /**
-   * Creates an instance of the ImageSaver runnable
+   * Creates an instance of the ImageSaver runnable, reading the image's bytes and closing it.
    *
    * @param image - The image to save
    * @param file - The file to save the image to
    * @param callback - The callback that is run on completion, or when an error is encountered.
    */
   ImageSaver(@NonNull Image image, @NonNull File file, @NonNull Callback callback) {
-    this.image = image;
+    try {
+      ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+      bytes = new byte[buffer.remaining()];
+      buffer.get(bytes);
+    } finally {
+      image.close();
+    }
     this.file = file;
     this.callback = callback;
   }
 
   @Override
   public void run() {
-    ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-    byte[] bytes = new byte[buffer.remaining()];
-    buffer.get(bytes);
     FileOutputStream output = null;
     try {
       output = FileOutputStreamFactory.create(file);
@@ -53,7 +56,6 @@ public class ImageSaver implements Runnable {
     } catch (IOException e) {
       callback.onError("IOError", "Failed saving image");
     } finally {
-      image.close();
       if (null != output) {
         try {
           output.close();
