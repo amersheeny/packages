@@ -619,7 +619,7 @@ class Camera
         onSuccessCallback.run();
       }
 
-    } catch (IllegalStateException e) {
+    } catch (IllegalStateException | SecurityException e) {
       onErrorCallback.onError("cameraAccess", "Camera is closed: " + e.getMessage());
     } catch (CameraAccessException e) {
       onErrorCallback.onError("cameraAccess", e.getMessage());
@@ -724,7 +724,7 @@ class Camera
                 CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE),
             backgroundHandler);
 
-      } catch (CameraAccessException | IllegalStateException e) {
+      } catch (CameraAccessException | IllegalStateException | SecurityException e) {
         failPictureCapture(e.getMessage());
       }
     }
@@ -769,7 +769,7 @@ class Camera
       CaptureRequest.Builder stillBuilder;
       try {
         stillBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-      } catch (CameraAccessException e) {
+      } catch (CameraAccessException | SecurityException e) {
         failPictureCapture(e.getMessage());
         return;
       }
@@ -806,7 +806,7 @@ class Camera
       try {
         Log.i(TAG, "sending capture request");
         captureSession.capture(stillBuilder.build(), captureCallback, backgroundHandler);
-      } catch (CameraAccessException | IllegalStateException e) {
+      } catch (CameraAccessException | IllegalStateException | SecurityException e) {
         failPictureCapture(e.getMessage());
       }
     }
@@ -852,14 +852,18 @@ class Camera
     Log.i(TAG, "runPictureAutoFocus");
 
     cameraCaptureCallback.setCameraState(CameraState.STATE_WAITING_FOCUS);
-    lockAutoFocus();
+    lockAutoFocus((errorCode, errorMessage) -> failPictureCapture(errorMessage));
   }
 
-  private void lockAutoFocus() {
+  private void lockAutoFocus(@NonNull ErrorCallback onErrorCallback) {
     Log.i(TAG, "lockAutoFocus");
     synchronized (captureSessionLock) {
       if (captureSession == null) {
-        Log.i(TAG, "[unlockAutoFocus] captureSession null, returning");
+        // An open camera with no session is usually configuring a new one; its first capture
+        // results let the focus timeout move the picture on. If configuration fails, none arrive.
+        if (cameraDevice == null) {
+          onErrorCallback.onError("cameraAccess", "The camera was closed.");
+        }
         return;
       }
 
@@ -873,12 +877,12 @@ class Camera
             createTriggerResetCallback(
                 CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE),
             backgroundHandler);
-      } catch (CameraAccessException | IllegalStateException e) {
+      } catch (CameraAccessException | IllegalStateException | SecurityException e) {
         String message =
             (e.getMessage() == null)
                 ? e.getClass().getSimpleName() + " occurred while locking autofocus."
                 : e.getMessage();
-        dartMessenger.sendCameraErrorEvent(message);
+        onErrorCallback.onError("cameraAccess", message);
       }
     }
   }
@@ -907,7 +911,7 @@ class Camera
             CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
 
         captureSession.capture(previewRequestBuilder.build(), null, backgroundHandler);
-      } catch (CameraAccessException | IllegalStateException e) {
+      } catch (CameraAccessException | IllegalStateException | SecurityException e) {
         String message =
             (e.getMessage() == null)
                 ? e.getClass().getSimpleName() + " occurred while unlocking autofocus."
@@ -1099,7 +1103,8 @@ class Camera
               Log.i(TAG, "[unlockAutoFocus] captureSession null, returning");
               return;
             }
-            lockAutoFocus();
+            lockAutoFocus(
+                (errorCode, errorMessage) -> dartMessenger.sendCameraErrorEvent(errorMessage));
 
             // Set AF state to idle again.
             previewRequestBuilder.set(

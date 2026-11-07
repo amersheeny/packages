@@ -1211,6 +1211,107 @@ public class CameraTest {
     verify(mockCaptureSession, never()).capture(any(), any(), any());
   }
 
+  private static final String ACCESS_REVOKED =
+      "checkPidStatus:2206: Attempt to use camera from a different process than original client";
+
+  @Test
+  public void setFocusMode_shouldSendErrorEventWhenCameraAccessIsRevoked()
+      throws CameraAccessException {
+    when(mockCaptureSession.capture(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    camera.setFocusMode(FocusMode.locked);
+    verify(mockDartMessenger, times(1)).sendCameraErrorEvent(ACCESS_REVOKED);
+  }
+
+  @Test
+  public void takePicture_shouldEndThePictureWhenCameraAccessIsRevokedWhileFocusing()
+      throws CameraAccessException {
+    useCameraTakingAutoFocusPictures();
+    when(mockCaptureSession.capture(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    Messages.Result<String> result = takePicture();
+    verify(mockDartMessenger, times(1)).error(result, "cameraAccess", ACCESS_REVOKED, null);
+    verify(mockDartMessenger, never()).sendCameraErrorEvent(any());
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void takePicture_shouldEndThePictureWhenTheCameraIsClosedBeforeFocusing() {
+    useCameraTakingAutoFocusPictures();
+    camera.cameraDevice = null;
+    camera.captureSession = null;
+    Messages.Result<String> result = takePicture();
+    verify(mockDartMessenger, times(1))
+        .error(result, "cameraAccess", "The camera was closed.", null);
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void takePicture_shouldKeepWaitingForFocusWhileTheCaptureSessionIsReplaced() {
+    useCameraTakingAutoFocusPictures();
+    camera.cameraDevice = mock(CameraDeviceWrapper.class);
+    camera.captureSession = null;
+    takePicture();
+    verify(mockDartMessenger, never()).error(any(), any(), any(), any());
+    verify(mockDartMessenger, never()).sendCameraErrorEvent(any());
+    assertEquals(CameraState.STATE_WAITING_FOCUS, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void unlockAutoFocus_shouldSendErrorEventWhenCameraAccessIsRevoked()
+      throws CameraAccessException {
+    when(mockCaptureSession.capture(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    camera.unlockAutoFocus();
+    verify(mockDartMessenger, times(1)).sendCameraErrorEvent(ACCESS_REVOKED);
+  }
+
+  @Test
+  public void refreshPreviewCaptureSession_shouldReportRevokedCameraAccess()
+      throws CameraAccessException {
+    when(mockCaptureSession.setRepeatingRequest(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    List<String> errors = new ArrayList<>();
+    camera.refreshPreviewCaptureSession(null, (code, message) -> errors.add(code + ": " + message));
+    assertEquals(1, errors.size());
+    assertEquals("cameraAccess: Camera is closed: " + ACCESS_REVOKED, errors.get(0));
+  }
+
+  @Test
+  public void onPrecapture_shouldEndThePictureWhenCameraAccessIsRevoked()
+      throws CameraAccessException {
+    Messages.Result<String> result = prepareStillCapture();
+    camera.cameraCaptureCallback.setCameraState(CameraState.STATE_WAITING_FOCUS);
+    when(mockCaptureSession.capture(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    camera.onPrecapture();
+    verify(mockDartMessenger, times(1)).error(result, "cameraAccess", ACCESS_REVOKED, null);
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void onConverged_shouldEndThePictureWhenCameraAccessIsRevoked()
+      throws CameraAccessException {
+    Messages.Result<String> result = prepareStillCapture();
+    when(mockCaptureSession.capture(any(), any(), any()))
+        .thenThrow(new SecurityException(ACCESS_REVOKED));
+    camera.onConverged();
+    verify(mockDartMessenger, times(1)).error(result, "cameraAccess", ACCESS_REVOKED, null);
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
+  @Test
+  public void onConverged_shouldEndThePictureWhenCameraAccessIsRevokedBeforeTheStillRequest()
+      throws CameraAccessException {
+    Messages.Result<String> result = prepareStillCapture();
+    CameraDeviceWrapper device = mock(CameraDeviceWrapper.class);
+    when(device.createCaptureRequest(anyInt())).thenThrow(new SecurityException(ACCESS_REVOKED));
+    camera.cameraDevice = device;
+    camera.onConverged();
+    verify(mockDartMessenger, times(1)).error(result, "cameraAccess", ACCESS_REVOKED, null);
+    assertEquals(CameraState.STATE_PREVIEW, camera.cameraCaptureCallback.getCameraState());
+  }
+
   @Test
   public void refreshPreviewCaptureSession_shouldRunItsCallbackWithoutHoldingTheLock() {
     AtomicBoolean ranHoldingTheLock = new AtomicBoolean(true);
@@ -1395,6 +1496,38 @@ public class CameraTest {
     return thread.getState() == Thread.State.BLOCKED
         && stack.length > 0
         && stack[0].getMethodName().equals(methodName);
+  }
+
+  private void useCameraTakingAutoFocusPictures() {
+    when(mockActivity.getApplicationContext()).thenReturn(mock(Context.class));
+    TextureRegistry.SurfaceTextureEntry flutterTexture =
+        mock(TextureRegistry.SurfaceTextureEntry.class);
+    when(flutterTexture.surfaceTexture()).thenReturn(mock(SurfaceTexture.class));
+    camera =
+        new Camera(
+            mockActivity,
+            flutterTexture,
+            mockCameraFeatureFactory,
+            mockDartMessenger,
+            mockCameraProperties,
+            new Camera.VideoCaptureSettings(ResolutionPreset.high, false));
+    camera.captureSession = mockCaptureSession;
+    camera.previewRequestBuilder = mockPreviewRequestBuilder;
+    camera.pictureImageReader = mock(ImageReader.class);
+    AutoFocusFeature autoFocus =
+        mockCameraFeatureFactory.createAutoFocusFeature(mockCameraProperties, false);
+    when(autoFocus.checkIsSupported()).thenReturn(true);
+    when(autoFocus.getValue()).thenReturn(FocusMode.auto);
+  }
+
+  @SuppressWarnings("unchecked")
+  private Messages.Result<String> takePicture() {
+    Messages.Result<String> result = mock(Messages.Result.class);
+    try (MockedStatic<File> file = mockStatic(File.class)) {
+      file.when(() -> File.createTempFile(any(), any(), any())).thenReturn(new File("CAP.jpg"));
+      camera.takePicture(result);
+    }
+    return result;
   }
 
   @SuppressWarnings("unchecked")

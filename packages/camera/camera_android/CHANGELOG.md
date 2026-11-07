@@ -1,6 +1,8 @@
 ## 0.10.12+3
 
 * Fixes a crash when the camera is closed while a picture is being saved.
+* Fixes a crash when camera access is revoked while a picture is being taken.
+* Fixes `takePicture` never completing when autofocus cannot be locked.
 
 ## 0.10.12+2
 
